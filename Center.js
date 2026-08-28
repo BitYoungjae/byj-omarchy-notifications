@@ -106,6 +106,77 @@ function parseExecArgv(value) {
   return parsed
 }
 
+// ------------------------------------------------------------- list model
+
+// The roles one row paints. Deliberately narrower than a stored entry: the
+// rest (execArgv, urgency, icons) is only ever read back out of the service
+// by key, so putting it in the view model would only cost redraws.
+function rowData(entry) {
+  var e = entry || {}
+  return {
+    key: String(e.key || ""),
+    app: String(e.app || ""),
+    summary: String(e.summary || ""),
+    body: String(e.body || ""),
+    timestamp: Number(e.timestamp) || 0,
+    unread: e.unread === true
+  }
+}
+
+// Fold a fresh entries array into the panel's ListModel in place.
+//
+// Handing the ListView a plain JS array works, but every reassignment is a
+// model reset: the view drops its delegates and relays out from the top. That
+// throws the scroll position away on each mark-as-read and on each
+// notification that lands while the panel is open — right when the user is
+// working down the list. Editing the rows that actually changed keeps the
+// delegates, and the scroll, alive.
+function syncRows(model, rows) {
+  var list = rows || []
+
+  // Removals first, so what survives keeps its relative order and the pass
+  // below only ever meets genuinely new keys.
+  var live = ({})
+  for (var i = 0; i < list.length; i++) live[String(list[i].key)] = true
+  for (var j = model.count - 1; j >= 0; j--) {
+    if (!live[model.get(j).key]) model.remove(j)
+  }
+
+  for (var k = 0; k < list.length; k++) {
+    var next = rowData(list[k])
+    if (k >= model.count) {
+      model.append(next)
+      continue
+    }
+
+    var current = model.get(k)
+    if (current.key !== next.key) {
+      // Entries are newest-first and only ever prepended, so a mismatch here
+      // is an arrival. A reorder would still land correctly: the key is
+      // looked for further down before giving up and inserting.
+      var moved = -1
+      for (var m = k + 1; m < model.count; m++) {
+        if (model.get(m).key === next.key) {
+          moved = m
+          break
+        }
+      }
+      if (moved < 0) {
+        model.insert(k, next)
+        continue
+      }
+      model.move(moved, k, 1)
+      current = model.get(k)
+    }
+
+    for (var role in next) {
+      if (current[role] !== next[role]) model.setProperty(k, role, next[role])
+    }
+  }
+
+  if (model.count > list.length) model.remove(list.length, model.count - list.length)
+}
+
 // ---------------------------------------------------------------- display
 
 // The bell's hover text. A sentence rather than a bare count, because on a

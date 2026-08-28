@@ -37,6 +37,22 @@ Panel {
   property string tab: "unread"
   readonly property var rows: tab === "unread" ? unreadRows : allRows
 
+  // The view model is edited in place rather than reassigned: handing the
+  // ListView a fresh array resets it, and a reset drops the scroll position
+  // on every mark-as-read and on every notification that lands while the
+  // panel is open. See Center.syncRows.
+  ListModel { id: rowModel }
+  onRowsChanged: Center.syncRows(rowModel, root.rows)
+  Component.onCompleted: Center.syncRows(rowModel, root.rows)
+
+  // The two deliberate exceptions: another tab is another list, and a fresh
+  // visit should start at the newest notification rather than wherever the
+  // last one stopped. Deferred so the row sync driven by the same change has
+  // already run.
+  onTabChanged: Qt.callLater(root.resetScroll)
+  onOpenedChanged: if (root.opened) Qt.callLater(root.resetScroll)
+  function resetScroll() { list.positionViewAtBeginning() }
+
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
   readonly property color foreground: bar ? bar.foreground : Color.foreground
   readonly property color dimmed: Qt.darker(foreground, 1.5)
@@ -236,16 +252,18 @@ Panel {
             visible: root.rows.length > 0
             clip: true
             spacing: Style.space(2)
-            model: root.rows
+            model: rowModel
             boundsBehavior: Flickable.StopAtBounds
             ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
 
             delegate: Item {
               id: entry
-              required property var modelData
-              required property int index
-
-              readonly property bool unread: modelData.unread === true
+              required property string key
+              required property string app
+              required property string summary
+              required property string body
+              required property double timestamp
+              required property bool unread
 
               width: ListView.view.width
               implicitHeight: entryBody.implicitHeight + Style.space(14)
@@ -291,7 +309,7 @@ Panel {
                     anchors.left: parent.left
                     anchors.right: timeLabel.left
                     anchors.rightMargin: Style.space(8)
-                    text: Center.appLabel(entry.modelData)
+                    text: Center.appLabel(entry)
                     color: root.dimmed
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.caption
@@ -303,7 +321,7 @@ Panel {
                   Text {
                     id: timeLabel
                     anchors.right: parent.right
-                    text: Center.relativeTime(entry.modelData.timestamp, root.now)
+                    text: Center.relativeTime(entry.timestamp, root.now)
                     color: root.dimmed
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.caption
@@ -313,7 +331,7 @@ Panel {
                 Text {
                   width: parent.width
                   visible: text !== ""
-                  text: String(entry.modelData.summary || "")
+                  text: entry.summary
                   color: entry.unread ? root.foreground : Qt.darker(root.foreground, 1.25)
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.body
@@ -324,7 +342,7 @@ Panel {
                 Text {
                   width: parent.width
                   visible: text !== ""
-                  text: Center.bodyText(entry.modelData)
+                  text: Center.bodyText(entry)
                   color: root.dimmed
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.bodySmall
@@ -347,10 +365,10 @@ Panel {
                 onClicked: function(mouse) {
                   if (!root.service) return
                   if (mouse.button === Qt.RightButton) {
-                    root.service.markRead(entry.modelData.key)
+                    root.service.markRead(entry.key)
                     return
                   }
-                  root.service.activate(entry.modelData.key)
+                  root.service.activate(entry.key)
                   root.close()
                 }
               }
