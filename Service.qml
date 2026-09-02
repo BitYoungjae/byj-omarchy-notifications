@@ -15,7 +15,9 @@ import "Center.js" as Center
 //
 // What it adds is the two things the first-party service has no reason to
 // keep: a read flag per notification, and a backlog deeper than the ten
-// entries its own history directory retains.
+// entries its own history directory retains. And one thing it cannot do on
+// its own terms: keep a notification clickable after its toast has gone
+// (see LiveNotifications.qml).
 Item {
   id: service
 
@@ -68,6 +70,19 @@ Item {
   // undo itself on the next do-not-disturb tick.
   property double clearedBefore: 0
 
+  // The live objects behind the entries that arrived this session, kept open
+  // at the sender past their toast so a row click can still run the same
+  // action the toast would have. Everything else about a notification is a
+  // snapshot; this is the one live thing, and it degrades to nothing.
+  LiveNotifications {
+    id: live
+    source: service.source
+    onSuperseded: function(key) { service.forget(key) }
+  }
+
+  readonly property bool liveActionsSupported: live.supported
+  readonly property int liveCount: live.count
+
   function entryFor(key) {
     var k = String(key || "")
     for (var i = 0; i < entries.length; i++) if (entries[i].key === k) return entries[i]
@@ -112,7 +127,16 @@ Item {
 
   function commit(list) {
     entries = Center.normalize(list, retention)
+    // An entry that just aged out of the store can no longer be clicked, so
+    // its sender may as well hear that it is done with.
+    live.prune(keyIndex(entries))
     scheduleSave()
+  }
+
+  function keyIndex(list) {
+    var index = ({})
+    for (var i = 0; i < list.length; i++) index[list[i].key] = true
+    return index
   }
 
   // Every notification that reaches the screen passes through the
@@ -143,7 +167,11 @@ Item {
       // originalId -1 and is not a notification.
       if (!row || row.originalId < 0) continue
       var entry = Center.entryFromRow(row)
-      if (entry) batch.push(entry)
+      if (!entry) continue
+      // Same watermark as absorb: what a clear left on screen is not the
+      // center's to keep hold of either.
+      if (entry.timestamp > service.clearedBefore) live.retain(row)
+      batch.push(entry)
     }
     absorb(batch)
   }
@@ -237,6 +265,16 @@ Item {
     scheduleSave()
   }
 
+  // Drop one entry without moving the cleared watermark: the sender replaced
+  // it in place, and the replacement is on its way in as an entry of its own.
+  function forget(key) {
+    var k = String(key || "")
+    var next = entries.filter(function(entry) { return entry.key !== k })
+    if (next.length === entries.length) return
+    entries = next
+    scheduleSave()
+  }
+
   // Empties the center. The first-party history is left as it is — its own
   // `showHistory` replay is not this plugin's to erase — so the watermark
   // below is what keeps the sweep from reading it all straight back in.
@@ -247,6 +285,8 @@ Item {
     // Anything still on screen outlives the clear: it has not been dealt
     // with yet, and it would reappear on the next ingest anyway.
     clearedBefore = Math.max(clearedBefore, newest)
+    // Cleared is dealt with, as far as the senders are concerned.
+    live.releaseAll()
     entries = []
     scheduleSave()
     ingestPopups()
@@ -254,49 +294,64 @@ Item {
 
   // ------------------------------------------------------------- activation
 
-  // Click-through for a center row, mirroring what clicking the toast does.
-  // A notification still on screen is handed back to the first-party service
-  // so a live libnotify action still gets its chance and the toast is
-  // dismissed with it. An archived one has no live sender left, so its
-  // recorded execArgv and the name of the app that sent it are all there is
-  // to act on — enough for the two cases that matter: Omarchy's own action
-  // toasts, and click-to-focus for chat apps.
+  // Click-through for a center row: the same steps, in the same order, that
+  // clicking the toast runs.
+  //
+  //   1. Omarchy's own action toasts carry their click as data (execArgv),
+  //      which the store keeps, so they work from a row indefinitely.
+  //   2. The sender's own default action — Slack's "open this channel",
+  //      Ghostty's "raise this tab" — kept alive past the toast by
+  //      LiveNotifications. The only step that can reach the exact target.
+  //   3. Bring the sender's window forward. All that is left once the
+  //      notification is closed at the sender: after a shell restart, for one
+  //      silenced under do-not-disturb, or when the first-party's shape has
+  //      changed under us and nothing is being retained.
+  //
+  // A toast still on screen comes down with the click, as it would have had
+  // the toast itself been clicked.
   function activate(key) {
     var k = String(key || "")
     var entry = entryFor(k)
     markRead(k)
     if (!entry) return
 
-    if (sourceReady && source.popupModel && typeof source.invokePopupDefault === "function") {
-      var model = source.popupModel
-      for (var i = 0; i < model.count; i++) {
-        var row = null
-        try {
-          row = model.get(i)
-        } catch (e) {
-          continue
-        }
-        if (row && row.originalId >= 0 && Center.rowKey(row) === k) {
-          source.invokePopupDefault(i)
-          return
-        }
-      }
-    }
-
     var argv = Center.parseExecArgv(entry.execArgv)
     if (argv) {
+      // Detached so it outlives the shell, which installer toasts depend on:
+      // they restart it.
       Util.execArgv(argv)
-      return
+      live.release(k)
+    } else if (!live.invoke(k)) {
+      live.release(k)
+      focusWindow(Center.focusPatterns(entry))
     }
-    focusApp(entry.app)
+    dismissToast(k)
   }
 
-  // Focus an existing Hyprland window belonging to the sender. The Omarchy
-  // helper does the case-insensitive class matching.
-  function focusApp(app) {
-    var name = String(app || "")
-    if (!name) return
-    focusProc.command = ["omarchy-hyprland-focus-app", name]
+  function dismissToast(key) {
+    if (!sourceReady || !source.popupModel || typeof source.dismissPopup !== "function") return
+    var model = source.popupModel
+    for (var i = 0; i < model.count; i++) {
+      var row = null
+      try {
+        row = model.get(i)
+      } catch (e) {
+        continue
+      }
+      if (row && row.originalId >= 0 && Center.rowKey(row) === key) {
+        source.dismissPopup(i)
+        return
+      }
+    }
+  }
+
+  // Focus an existing Hyprland window belonging to the sender, trying each
+  // pattern in turn. The Omarchy helper does the case-insensitive matching.
+  function focusWindow(patterns) {
+    if (!patterns || patterns.length === 0 || focusProc.running) return
+    focusProc.command = ["bash", "-c",
+      'for pattern in "$@"; do omarchy-hyprland-focus-app "$pattern" && exit 0; done; exit 1',
+      "--"].concat(patterns)
     focusProc.running = true
   }
 

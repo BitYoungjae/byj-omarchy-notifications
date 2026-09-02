@@ -85,6 +85,8 @@ function normalize(entries, limit) {
   return max > 0 ? out.slice(0, max) : out
 }
 
+// ---------------------------------------------------------------- activation
+
 // Validate a persisted omarchy-exec-argv hint into a runnable argv, or null.
 // Structural only, and fails closed: a non-array, a non-string member, an
 // empty program, or a leading-dash program that argv would read as an option.
@@ -104,6 +106,75 @@ function parseExecArgv(value) {
   }
   if (!parsed[0] || parsed[0].charAt(0) === "-") return null
   return parsed
+}
+
+// Senders that never own a window, so there is nothing to bring forward.
+function isEphemeralApp(app) {
+  var name = String(app || "")
+  return name === "notify-send" || name === "omarchy-action"
+}
+
+// Browsers stamp their own name on every web notification, so the app name
+// reads "Google Chrome" whether the sender was Slack, Gmail or a random tab.
+// Mirrors the first-party check so the same senders get the same treatment.
+function isChromiumDerived(app, appIcon) {
+  var source = (String(app || "") + "\n" + String(appIcon || "")).toLowerCase()
+  return source.indexOf("chrom") >= 0 || source.indexOf("brave") >= 0
+    || source.indexOf("vivaldi") >= 0 || source.indexOf("microsoft-edge") >= 0
+    || source.indexOf("opera") >= 0
+}
+
+// Chromium prefixes a web notification's body with the origin it came from,
+// as a link ("<a href=...>app.slack.com</a>") or a bare host. That is the only
+// trace of the real sender the notification carries — and it is also how its
+// window is found: a Chromium web app's window class is
+// "chrome-<host>__<path>-<profile>". Same shapes the first-party strips for
+// display, read here for the host instead.
+var LEADING_LINK_HOST = /^\s*<a\b[^>]*>\s*(?:https?:\/\/|www\.)?((?:[a-z0-9-]+\.)+[a-z]{2,})(?::\d+)?(?:\/[^<\s]*)?\s*<\/a>/i
+var LEADING_BARE_HOST = /^\s*(?:https?:\/\/|www\.)?((?:[a-z0-9-]+\.)+[a-z]{2,})(?::\d+)?(?:\/\S*)?\s+/i
+
+function originHost(body) {
+  var text = String(body || "")
+  var match = LEADING_LINK_HOST.exec(text) || LEADING_BARE_HOST.exec(text)
+  return match ? match[1].toLowerCase() : ""
+}
+
+// A themed icon name — "com.mitchellh.ghostty", not a file:// URL or a path —
+// is usually the sender's application id, which is also its window class.
+// GLib applications (Ghostty among them) send no app name at all, and this
+// is then all that identifies them.
+function isIconName(value) {
+  var s = String(value || "")
+  return s.length > 0 && s.indexOf("/") < 0 && s.indexOf(":") < 0
+}
+
+function escapeRegex(text) {
+  return String(text || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+}
+
+// The window-class hints a notification carries, most specific first, as
+// case-insensitive regexes for omarchy-hyprland-focus-app to try in turn.
+// This is the click-through of last resort: what a row does once the
+// notification has no action left to run (the sender closed it, the shell
+// restarted, or it arrived silenced) and the best it can do is bring the
+// sender's window forward.
+function focusPatterns(entry) {
+  var e = entry || {}
+  var app = String(e.app || "").trim()
+  var icon = String(e.appIcon || "").trim()
+  var out = []
+  function add(value) {
+    if (value && out.indexOf(value) < 0) out.push(value)
+  }
+  if (isChromiumDerived(app, icon)) add(escapeRegex(originHost(e.body)))
+  if (!isEphemeralApp(app)) {
+    add(escapeRegex(app))
+    // "Google Chrome" notifies under its display name while its window class
+    // is google-chrome; the hyphenated form is what desktop entries end up as.
+    add(escapeRegex(app.replace(/\s+/g, "-")))
+  }
+  if (isIconName(icon)) add(escapeRegex(icon))
+  return out
 }
 
 // ------------------------------------------------------------- list model
@@ -248,4 +319,28 @@ function relativeTime(timestamp, now) {
   if (days < 7) return days + "d"
 
   return Qt.formatDateTime(new Date(then), "d MMM")
+}
+
+// Loaded by QML as a plain script, and by `node --test` as a module.
+if (typeof module !== "undefined") {
+  module.exports = {
+    rowKey: rowKey,
+    entryFromRow: entryFromRow,
+    entryChanged: entryChanged,
+    parseHistory: parseHistory,
+    normalize: normalize,
+    parseExecArgv: parseExecArgv,
+    isEphemeralApp: isEphemeralApp,
+    isChromiumDerived: isChromiumDerived,
+    originHost: originHost,
+    isIconName: isIconName,
+    escapeRegex: escapeRegex,
+    focusPatterns: focusPatterns,
+    rowData: rowData,
+    tooltip: tooltip,
+    badgeText: badgeText,
+    tabLabel: tabLabel,
+    appLabel: appLabel,
+    bodyText: bodyText
+  }
 }

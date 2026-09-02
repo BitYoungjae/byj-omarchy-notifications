@@ -96,6 +96,39 @@ Panel {
       if (root.service) root.service.clearAll()
       return "ok"
     }
+
+    // Click-through, exactly what left-clicking the row does. The key is the
+    // store's: the first-party's file name, <timestamp>-<id>.json.
+    function activate(key: string): string {
+      if (!root.service || !root.service.entryFor(key)) return "unknown"
+      root.service.activate(key)
+      if (root.opened) root.close()
+      return "ok"
+    }
+
+    // The newest unread notification, or the newest of all once everything
+    // has been read. Meant for a keybinding: "take me to what just came in".
+    function activateLatest(): string {
+      var rows = root.unreadRows.length > 0 ? root.unreadRows : root.allRows
+      if (!root.service || rows.length === 0) return "none"
+      root.service.activate(rows[0].key)
+      if (root.opened) root.close()
+      return rows[0].key
+    }
+
+    // What the center is holding, for a quick look when a click did not do
+    // what was expected. `live` is how many notifications are still open at
+    // their sender; `liveActions` false means the first-party service no
+    // longer has the shape this plugin attaches to and rows only focus.
+    function status(): string {
+      return JSON.stringify({
+        unread: root.unreadCount,
+        total: root.allRows.length,
+        live: root.service ? root.service.liveCount : 0,
+        liveActions: root.service ? root.service.liveActionsSupported : false,
+        doNotDisturb: root.dnd
+      })
+    }
   }
 
   // ---------------------------------------------------------- bar button
