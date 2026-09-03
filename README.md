@@ -93,6 +93,19 @@ shown. So while do-not-disturb is on — and only then — the plugin also sweep
 that directory every five seconds. Omarchy keeps ten entries there, so nothing
 is missed unless more than ten arrive between ticks.
 
+### After a reboot
+
+The first-party service mirrors every toast on screen to a file and re-shows
+the files it finds when it starts, so that toasts survive the shell restart
+`omarchy-update` performs. A toast that never expires — anything critical,
+which is how Cursor asks for input and how Omarchy reports a crash — therefore
+comes back after a reboot too, and after every reboot until it is dismissed.
+Across a shell restart that is right; across a boot it is yesterday's, and the
+centre is where it belongs. So a restored toast from before the current boot
+is taken off the screen and left to its row, read flag intact. It is archived
+into Omarchy's own history on the way, exactly as its expiry would have done,
+so `showHistory` can still replay it — and a replay is left alone.
+
 ### Click-through
 
 Clicking a row runs the same steps, in the same order, that clicking the toast

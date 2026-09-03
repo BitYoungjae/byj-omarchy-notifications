@@ -82,3 +82,28 @@ test("normalize is newest-first, deduped and capped", () => {
   assert.deepEqual(Center.normalize(rows, 2).map(e => e.key), ["b", "c"])
   assert.deepEqual(Center.normalize(rows, 0).map(e => e.key), ["b", "c", "a"])
 })
+
+test("parseStaleSweep reads the boot time and the popup files on disk", () => {
+  const sweep = Center.parseStaleSweep("btime 1788397012\n1788350000000-990.json\n1788397200000-991.json\n")
+  assert.equal(sweep.bootTime, 1788397012000)
+  assert.deepEqual(Object.keys(sweep.files).sort(), ["1788350000000-990.json", "1788397200000-991.json"])
+})
+
+test("parseStaleSweep without a boot time judges nothing stale", () => {
+  const yesterday = { timestamp: 1788350000000, originalId: 990 }
+  assert.equal(Center.parseStaleSweep("1788350000000-990.json\n").bootTime, 0)
+  assert.equal(Center.isStaleToast(yesterday, Center.parseStaleSweep("1788350000000-990.json\n")), false)
+  assert.equal(Center.isStaleToast(yesterday, Center.parseStaleSweep("")), false)
+  assert.equal(Center.isStaleToast(yesterday, Center.parseStaleSweep("btime nope\n1788350000000-990.json\n")), false)
+})
+
+test("isStaleToast wants a popup file from before this boot", () => {
+  const sweep = Center.parseStaleSweep("btime 1788397012\n1788350000000-990.json\n1788397200000-991.json\n")
+  // Yesterday's, file among the popups: a reboot re-showed it.
+  assert.equal(Center.isStaleToast({ timestamp: 1788350000000, originalId: 990 }, sweep), true)
+  // This boot's, file among the popups: a shell restart re-showed it.
+  assert.equal(Center.isStaleToast({ timestamp: 1788397200000, originalId: 991 }, sweep), false)
+  // Yesterday's, no popup file: a showHistory replay out of the history dir.
+  assert.equal(Center.isStaleToast({ timestamp: 1788350000000, originalId: 7 }, sweep), false)
+  assert.equal(Center.isStaleToast(null, sweep), false)
+})

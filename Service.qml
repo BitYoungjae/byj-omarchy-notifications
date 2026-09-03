@@ -17,7 +17,10 @@ import "Center.js" as Center
 // keep: a read flag per notification, and a backlog deeper than the ten
 // entries its own history directory retains. And one thing it cannot do on
 // its own terms: keep a notification clickable after its toast has gone
-// (see LiveNotifications.qml).
+// (see LiveNotifications.qml). And it takes one thing off the first-party's
+// hands once a center exists: a toast that a reboot brought back from the
+// day before belongs in the list, not on the screen (see the stale-toast
+// sweep).
 Item {
   id: service
 
@@ -44,10 +47,13 @@ Item {
   readonly property string stateDir: home + "/.local/state/byj-notification-center/"
   readonly property string storePath: stateDir + "store.json"
 
-  // Where the first-party service parks notifications that have left the
-  // screen. Read only as the do-not-disturb backstop below — everything that
+  // The first-party's popup state: one file per toast on screen, which is
+  // how its toasts survive a shell restart (see the stale-toast sweep), and
+  // under it the notifications that have left the screen. The history is
+  // read only as the do-not-disturb backstop below — everything that
   // actually gets shown is picked up from popupModel, in process.
-  readonly property string sourceHistoryDir: home + "/.local/state/omarchy/notifications/history/"
+  readonly property string sourcePopupDir: home + "/.local/state/omarchy/notifications/"
+  readonly property string sourceHistoryDir: sourcePopupDir + "history/"
 
   // How many notifications the center keeps. The first-party history is
   // capped at ten; this store is the reason the "All" tab can go deeper.
@@ -156,6 +162,7 @@ Item {
     if (!model) return
 
     var batch = []
+    var unjudged = false
     for (var i = 0; i < model.count; i++) {
       var row = null
       try {
@@ -171,9 +178,94 @@ Item {
       // Same watermark as absorb: what a clear left on screen is not the
       // center's to keep hold of either.
       if (entry.timestamp > service.clearedBefore) live.retain(row)
+      if (!staleJudged[entry.key] && isRestoredRow(row)) {
+        // Once the boot time is known a row from after it needs no sweep:
+        // it can only be this boot's.
+        if (bootTime > 0 && entry.timestamp >= bootTime) staleJudged[entry.key] = true
+        else unjudged = true
+      }
       batch.push(entry)
     }
     absorb(batch)
+    // After absorb, so a toast the sweep takes off the screen has its row.
+    if (unjudged) sweepStaleToasts()
+  }
+
+  function isRestoredRow(row) {
+    if (typeof source.isRestoredRow !== "function") return false
+    try {
+      return source.isRestoredRow(row) === true
+    } catch (e) {
+      return false
+    }
+  }
+
+  // ------------------------------------------------------------- stale toasts
+  //
+  // The first-party mirrors every toast on screen to a file under
+  // sourcePopupDir and re-shows whatever files it finds when it starts, so
+  // that toasts survive the shell restart an update performs. A toast that
+  // never expires — anything critical, which is how Cursor asks for input
+  // and how Omarchy reports a crash — is therefore re-shown after a reboot
+  // as well, and after every reboot until someone dismisses it. Across a
+  // shell restart that is right: the toast was on screen a moment ago.
+  // Across a boot it is yesterday's, and "what did I miss" is what the
+  // center is for — so a restored toast from before this boot is taken off
+  // the screen and left to its row, read flag intact. Dismissing archives
+  // it into the first-party history exactly as its own expiry would have,
+  // so `showHistory` can still replay it; and a replay, whose rows are
+  // restored too, is told apart by having no popup file and left alone.
+
+  // Restored rows the sweep has already judged, by key. A replayed critical
+  // toast can sit on screen for hours; without this every notification
+  // arriving meanwhile would run the sweep again for nothing.
+  property var staleJudged: ({})
+
+  // The machine's boot time in milliseconds, once a sweep has read it.
+  property double bootTime: 0
+
+  Process {
+    id: staleToastProc
+    running: false
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: service.retireStaleToasts(Center.parseStaleSweep(text))
+    }
+  }
+
+  // The boot time and the popup files on disk, read in one job so that the
+  // two describe the same moment. Fails closed: no boot time, no verdict.
+  function sweepStaleToasts() {
+    if (staleToastProc.running) return
+    staleToastProc.command = ["bash", "-c",
+      "awk '/^btime/{print \"btime\", $2}' /proc/stat\n" +
+      "for f in \"$1\"/*.json; do [[ -e $f ]] && printf '%s\\n' \"${f##*/}\"; done\n" +
+      "exit 0", "--", service.sourcePopupDir]
+    staleToastProc.running = true
+  }
+
+  function retireStaleToasts(sweep) {
+    if (sweep.bootTime > 0) bootTime = sweep.bootTime
+    if (!sourceReady || !source.popupModel) return
+    var model = source.popupModel
+    var stale = []
+    for (var i = 0; i < model.count; i++) {
+      var row = null
+      try {
+        row = model.get(i)
+      } catch (e) {
+        continue
+      }
+      if (!row || row.originalId < 0 || !isRestoredRow(row)) continue
+      var key = Center.rowKey(row)
+      staleJudged[key] = true
+      if (Center.isStaleToast(row, sweep)) stale.push(key)
+    }
+    if (stale.length === 0) return
+    // By key rather than index: each dismissal shifts the rows below it.
+    for (var j = 0; j < stale.length; j++) dismissToast(stale[j])
+    console.info("notification-center: " + stale.length
+      + " toast(s) from before this boot moved off the screen into the center")
   }
 
   // Do-not-disturb is the one path that never reaches popupModel: a silenced

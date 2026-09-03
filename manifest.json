@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "byj.notification-center",
   "name": "Notification Center",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "author": "bityoungjae",
   "description": "A bell in the bar with an unread badge, opening a flyout with unread and all-notification tabs",
   "kinds": [
