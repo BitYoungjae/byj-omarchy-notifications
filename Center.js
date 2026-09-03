@@ -177,44 +177,6 @@ function focusPatterns(entry) {
   return out
 }
 
-// ---------------------------------------------------------------- stale toasts
-
-// What the sweep in Service.qml reads back: the machine's boot time from
-// /proc/stat as a "btime <seconds>" line, then the name of every popup file
-// the first-party currently has on disk, one per line.
-function parseStaleSweep(raw) {
-  var lines = String(raw || "").split("\n")
-  var bootTime = 0
-  var files = {}
-  for (var i = 0; i < lines.length; i++) {
-    var line = lines[i].trim()
-    if (!line) continue
-    if (line.indexOf("btime ") === 0) {
-      var seconds = Number(line.slice(6))
-      if (isFinite(seconds) && seconds > 0) bootTime = seconds * 1000
-      continue
-    }
-    files[line] = true
-  }
-  return { bootTime: bootTime, files: files }
-}
-
-// A toast the first-party restored from a popup file written before this
-// boot. Across a shell restart a restored toast is the same toast back after
-// a flicker; across a boot it is yesterday's. The file is what tells a
-// startup restore from a `showHistory` replay: a replayed row is restored
-// too, but its file sits in the history directory, not among the popups.
-// Without a boot time nothing can be judged, so nothing is.
-function isStaleToast(row, sweep) {
-  var r = row || {}
-  var s = sweep || {}
-  var bootTime = Number(s.bootTime) || 0
-  if (bootTime <= 0) return false
-  var timestamp = Number(r.timestamp) || 0
-  if (timestamp <= 0 || timestamp >= bootTime) return false
-  return !!(s.files && s.files[rowKey(r)] === true)
-}
-
 // ------------------------------------------------------------- list model
 
 // The roles one row paints. Deliberately narrower than a stored entry: the
@@ -374,8 +336,6 @@ if (typeof module !== "undefined") {
     isIconName: isIconName,
     escapeRegex: escapeRegex,
     focusPatterns: focusPatterns,
-    parseStaleSweep: parseStaleSweep,
-    isStaleToast: isStaleToast,
     rowData: rowData,
     tooltip: tooltip,
     badgeText: badgeText,
