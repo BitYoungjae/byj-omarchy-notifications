@@ -31,6 +31,7 @@ test("entryFromNotification copies what the daemon exposes", () => {
     hints: { "desktop-entry": "com.mitchellh.ghostty", "omarchy-glyph": "󰂚", "omarchy-exec-argv": "[\"xdg-open\",\"x\"]" }
   }, 1789230000000)
   assert.equal(entry.key, "1789230000000-8")
+  assert.equal(entry.id, 8)
   assert.equal(entry.desktopEntry, "com.mitchellh.ghostty")
   assert.equal(entry.glyph, "󰂚")
   assert.equal(entry.execArgv, "[\"xdg-open\",\"x\"]")
@@ -41,11 +42,28 @@ test("entryFromNotification copies what the daemon exposes", () => {
   assert.equal(Center.entryFromNotification({ id: 2, summary: "x", transient: true }, 5).transient, true)
 })
 
+test("idFromKey reads the daemon id out of either key shape", () => {
+  assert.equal(Center.idFromKey("1789230000000-8"), 8)
+  assert.equal(Center.idFromKey("1789227107951-5.json"), 5)
+  assert.equal(Center.idFromKey(""), 0)
+  assert.equal(Center.idFromKey("garbage"), 0)
+})
+
+test("toastRowMatches pairs a popup row with its entry by id and moment", () => {
+  const entry = { id: 8, timestamp: 1789230000000 }
+  assert.equal(Center.toastRowMatches({ originalId: 8, timestamp: 1789230000012 }, entry), true)
+  assert.equal(Center.toastRowMatches({ originalId: 8, timestamp: 1789230000000 - 1500 }, entry), true)
+  assert.equal(Center.toastRowMatches({ originalId: 8, timestamp: 1789230005000 }, entry), false, "same id, another generation")
+  assert.equal(Center.toastRowMatches({ originalId: 9, timestamp: 1789230000000 }, entry), false)
+  assert.equal(Center.toastRowMatches({ originalId: 0, timestamp: 0 }, { id: 0, timestamp: 0 }), false)
+})
+
 test("entryFromStored accepts entries written by earlier versions", () => {
   const old = { key: "1789227107951-5.json", app: "", appIcon: "com.mitchellh.ghostty", summary: "Claude Code",
     body: "Claude is waiting for your input", glyph: "", execArgv: "", urgency: 1, timestamp: 1789227107951, unread: true }
   const entry = Center.entryFromStored(old)
   assert.equal(entry.key, "1789227107951-5.json")
+  assert.equal(entry.id, 5, "the id comes out of the old key")
   assert.equal(entry.desktopEntry, "")
   assert.equal(entry.expireTimeout, 0)
   assert.equal(entry.unread, true)

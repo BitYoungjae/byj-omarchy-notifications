@@ -7,35 +7,38 @@ import "Center.js" as Center
 
 // Notification center store.
 //
-// This plugin does NOT own the notification daemon. Omarchy's first-party
+// This plugin does NOT fork the notification daemon. Omarchy's first-party
 // `omarchy.notifications` keeps that role — it draws the toasts, owns
-// do-not-disturb and decides what leaves the screen when. What this plugin
-// owns is a second view of the same stream: Quickshell keeps one
-// notification server per process, and every `NotificationServer` declared
-// in that process hears every notification it receives. So this service
-// declares one of its own and records what comes through it — the same live
-// objects the first-party is handed, with everything they carry: the
-// transient hint, the requested timeout, the sender's desktop entry, its
-// actions, and the reason each one eventually closed.
+// do-not-disturb and decides what leaves the screen when — but since Omarchy
+// 4.0.3 a plugin's `shell.serviceFor` resolves only the plugin's own service,
+// so the first-party can no longer be attached to from the outside. It is
+// attached to from the inside instead: this plugin registers as the clone of
+// `omarchy.notifications` (see manifest.json), which makes it the enabled
+// implementation of that target, and then runs the *installed* first-party
+// service, unmodified and loaded by path, as `inner`. Every Omarchy update to
+// that file is picked up as it lands, and the shell's own consumers — the
+// bar's do-not-disturb indicator, `omarchy-shell notifications …` — reach it
+// through here exactly as they did before.
 //
-// Nothing here reaches into the first-party. Since Omarchy 4.0.3 a plugin's
-// `shell.serviceFor` resolves only the plugin's own service, so the earlier
-// design of attaching to the first-party's popup model is closed off; what
-// remains of do-not-disturb is read from the file the first-party writes it
-// to and toggled through its IPC.
+// Two things ride on that. The center's own record of every notification
+// comes from a second `NotificationServer` wrapper: Quickshell keeps one
+// server per process and hands every wrapper the same live objects, with
+// everything they carry (transient hint, requested timeout, desktop entry,
+// actions, and later the reason they closed). And with the first-party's
+// `liveRefs` in reach, a notification can be kept open at its sender past
+// its toast, so a row click can still run the very action the toast would
+// have (see LiveNotifications.qml).
 Item {
   id: service
 
-  // Injected by omarchy-shell's service loader. Unused: everything this
-  // service needs comes through the daemon and the file system.
+  // Injected by omarchy-shell's service loader, and handed on to the
+  // embedded first-party, which reads the bar's position and size off it.
   property var shell: null
+  property string omarchyPath: Quickshell.env("OMARCHY_PATH") || "/usr/share/omarchy"
 
   readonly property string home: Quickshell.env("HOME")
   readonly property string stateDir: home + "/.local/state/byj-notification-center/"
   readonly property string storePath: stateDir + "store.json"
-
-  // Where the first-party keeps its do-not-disturb preference.
-  readonly property string sourceSettingsPath: home + "/.local/state/omarchy/notifications.json"
 
   // How many notifications the center keeps. The first-party history is
   // capped at ten; this store is the reason the "All" tab can go deeper.
@@ -44,6 +47,37 @@ Item {
   // When this graphical session started, from Hyprland's instance signature.
   // Everything from before it is from a session whose windows are gone.
   readonly property double sessionStart: Center.sessionStartFromSignature(Quickshell.env("HYPRLAND_INSTANCE_SIGNATURE"))
+
+  // ------------------------------------------------------------- first-party
+
+  // The installed first-party notification service, running in here.
+  property var inner: null
+  readonly property string innerUrl: "file://" + omarchyPath + "/shell/plugins/notifications/Service.qml"
+
+  function loadInner() {
+    var component = Qt.createComponent(innerUrl)
+    if (component.status !== Component.Ready) {
+      console.warn("notification-center: could not load the first-party notification service from "
+        + innerUrl + ": " + component.errorString())
+      return
+    }
+    inner = component.createObject(service, { shell: service.shell, omarchyPath: service.omarchyPath })
+    if (!inner) console.warn("notification-center: the first-party notification service failed to start")
+  }
+
+  onShellChanged: if (inner) inner.shell = service.shell
+  onOmarchyPathChanged: if (inner) inner.omarchyPath = service.omarchyPath
+
+  // Do-not-disturb stays the first-party's state; the bell only mirrors and
+  // toggles it, so the two never disagree. These two are also what the
+  // shell reads off the enabled notifications service, which is now this.
+  readonly property bool doNotDisturb: inner ? inner.doNotDisturb === true : false
+
+  function setDoNotDisturb(value) {
+    if (inner && typeof inner.setDoNotDisturb === "function") inner.setDoNotDisturb(value === true)
+  }
+
+  // ------------------------------------------------------------- store
 
   // Newest-first plain snapshots. Deliberately not the live Notification
   // objects: those die with their sender, and reading a role off a destroyed
@@ -90,17 +124,29 @@ Item {
     onNotification: function(notification) { service.receive(notification) }
   }
 
-  // The live objects behind entries still open at the daemon, by key. The
-  // first-party tracks them and closes them as their toasts leave; until
-  // then a row click can still run the action the toast would have. This is
-  // the one live thing in the store, and it degrades to nothing.
+  // The live objects behind entries the daemon still considers open, by
+  // key, for the sake of hearing why each one closes. Everything else about
+  // a notification is a snapshot.
   property var held: ({})
-  property int heldCount: 0
 
   readonly property var updateSignals: [
     "summaryChanged", "bodyChanged", "appNameChanged", "appIconChanged",
     "urgencyChanged", "expireTimeoutChanged", "hintsChanged"
   ]
+
+  // Kept open at the sender past their toasts, so their rows can still run
+  // the sender's own click.
+  LiveNotifications {
+    id: live
+    source: service.inner
+    onSuperseded: function(key, notification) {
+      service.forget(key)
+      service.receive(notification)
+    }
+    onDismissedOnScreen: function(key) { service.markRead(key) }
+  }
+
+  readonly property int liveCount: live.count
 
   // A plain copy of what the entry needs, taken in one go: the object can be
   // torn down by the server at any later point.
@@ -143,9 +189,12 @@ Item {
       handlers: []
     }
     held[entry.key] = record
-    heldCount++
     connectSignals(record)
     absorb([entry])
+
+    // The first-party's own handler is what puts the object into liveRefs,
+    // and it runs after this one; take hold once it has.
+    Qt.callLater(function() { live.retain(entry.key, notification, entry.id) })
   }
 
   function connectSignals(record) {
@@ -185,7 +234,6 @@ Item {
   function drop(record) {
     if (held[record.key] !== record) return
     delete held[record.key]
-    heldCount--
     for (var i = 0; i < record.handlers.length; i++) {
       try {
         record.handlers[i].signal.disconnect(record.handlers[i].fn)
@@ -227,33 +275,17 @@ Item {
 
   function commit(list) {
     entries = Center.normalize(list, retention)
+    // An entry that just aged out of the store can no longer be clicked, so
+    // its sender may as well hear that it is done with.
+    live.prune(keyIndex(entries))
     scheduleSave()
   }
 
-  // ------------------------------------------------------------- do not disturb
-
-  // Do-not-disturb stays the first-party's state; the bell only mirrors and
-  // toggles it, so the two never disagree. The mirror is the file it
-  // persists the preference to, rewritten on every change.
-  property bool doNotDisturb: false
-
-  FileView {
-    id: sourceSettings
-    path: service.sourceSettingsPath
-    watchChanges: true
-    printErrors: false
-    onLoaded: service.doNotDisturb = Center.parseDnd(text()) === true
-    onLoadFailed: service.doNotDisturb = false
-    onFileChanged: reload()
+  function keyIndex(list) {
+    var index = ({})
+    for (var i = 0; i < list.length; i++) index[list[i].key] = true
+    return index
   }
-
-  function setDoNotDisturb(value) {
-    if (dndProc.running) return
-    dndProc.command = ["omarchy-shell", "notifications", "setDnd", value === true ? "on" : "off"]
-    dndProc.running = true
-  }
-
-  Process { id: dndProc; running: false }
 
   // ------------------------------------------------------------- read state
 
@@ -295,14 +327,28 @@ Item {
     scheduleSave()
   }
 
+  // Drop one entry without moving the cleared watermark: the sender replaced
+  // it in place, and the replacement is on its way in as an entry of its own.
+  function forget(key) {
+    var k = String(key || "")
+    var record = held[k]
+    if (record) drop(record)
+    var next = entries.filter(function(entry) { return entry.key !== k })
+    if (next.length === entries.length) return
+    entries = next
+    scheduleSave()
+  }
+
   // Empties the center. Toasts still on screen are the first-party's and
   // stay put; the watermark keeps their later edits and closes from
-  // reinstating them here.
+  // reinstating them here. Cleared is dealt with, as far as the senders are
+  // concerned.
   function clearAll() {
     var newest = 0
     for (var i = 0; i < entries.length; i++)
       if (entries[i].timestamp > newest) newest = entries[i].timestamp
     clearedBefore = Math.max(clearedBefore, newest)
+    live.releaseAll()
     entries = []
     scheduleSave()
   }
@@ -315,31 +361,32 @@ Item {
   //   1. Omarchy's own action toasts carry their click as data (execArgv),
   //      which the store keeps, so they work from a row indefinitely.
   //   2. The sender's own default action — Slack's "open this channel",
-  //      Ghostty's "raise this tab". Only while the notification is still
-  //      open at the daemon, which the first-party ends when the toast
-  //      leaves the screen.
-  //   3. Bring the sender's window forward. All that is left afterwards.
+  //      Ghostty's "raise this tab" — kept alive past the toast by
+  //      LiveNotifications. The only step that can reach the exact target.
+  //   3. Bring the sender's window forward. All that is left once the
+  //      notification is closed at the sender: after a shell restart, for one
+  //      silenced under do-not-disturb, or when the first-party's shape has
+  //      changed under us and nothing is being retained.
   //
   // A toast still on screen comes down with the click, as it would have had
-  // the toast itself been clicked. The first-party takes toasts down by
-  // summary, so an identical toast beside it comes down too.
+  // the toast itself been clicked.
   function activate(key) {
     var k = String(key || "")
     var entry = entryFor(k)
     markRead(k)
     if (!entry) return
 
-    var record = held[k]
     var argv = Center.parseExecArgv(entry.execArgv)
     if (argv) {
       // Detached so it outlives the shell, which installer toasts depend on:
       // they restart it.
       Util.execArgv(argv)
-    } else if (!invokeDefault(record)) {
+      live.release(k)
+    } else if (!live.invoke(k)) {
+      live.release(k)
       focusWindow(Center.focusPatterns(entry))
     }
-    // Held means its toast is most likely still up; critical never expires.
-    if (record || entry.urgency === 2) dismissToast(entry)
+    dismissToast(entry)
   }
 
   // Run a row's members as one: the newest gets the click, the rest are
@@ -356,31 +403,21 @@ Item {
     for (var i = 0; i < list.length; i++) markRead(list[i])
   }
 
-  function invokeDefault(record) {
-    if (!record) return false
-    try {
-      var actions = record.notification.actions
-      for (var i = 0; i < actions.length; i++) {
-        if (actions[i] && actions[i].identifier === "default") {
-          actions[i].invoke()
-          return true
-        }
-      }
-    } catch (e) {
-      // Torn down by the server — nothing to invoke.
-      drop(record)
-    }
-    return false
-  }
-
+  // The toast for an entry, live or restored after a shell restart, is the
+  // popup row carrying its daemon id from the same moment.
   function dismissToast(entry) {
-    var summary = String(entry && entry.summary || "")
-    if (!summary || dismissProc.running) return
-    dismissProc.command = ["omarchy-shell", "notifications", "dismiss", summary]
-    dismissProc.running = true
+    if (!inner || !inner.popupModel || typeof inner.dismissPopup !== "function") return
+    var model = inner.popupModel
+    for (var i = model.count - 1; i >= 0; i--) {
+      var row = null
+      try {
+        row = model.get(i)
+      } catch (e) {
+        continue
+      }
+      if (row && row.originalId >= 0 && Center.toastRowMatches(row, entry)) inner.dismissPopup(i)
+    }
   }
-
-  Process { id: dismissProc; running: false }
 
   // Focus an existing Hyprland window belonging to the sender, trying each
   // pattern in turn. The Omarchy helper does the case-insensitive matching.
@@ -470,11 +507,11 @@ Item {
 
   Component.onCompleted: {
     ensureDirProc.running = true
+    // The first-party goes up first: its wrapper registers after this
+    // service's own, and nothing should arrive between the two.
+    loadInner()
     // Give mkdir a tick before the read; FileView reports a missing file
     // through onLoadFailed, which loadStore handles.
-    Qt.callLater(function() {
-      storeFile.reload()
-      sourceSettings.reload()
-    })
+    Qt.callLater(function() { storeFile.reload() })
   }
 }

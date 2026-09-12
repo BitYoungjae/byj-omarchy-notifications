@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "byj.notification-center",
   "name": "Notification Center",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "author": "bityoungjae",
   "description": "A bell in the bar with an unread badge, opening a flyout with unread and all-notification tabs",
   "kinds": [
@@ -20,5 +20,8 @@
     "category": "System",
     "allowMultiple": false,
     "defaultSection": "right"
+  },
+  "omarchy": {
+    "clonedFrom": "omarchy.notifications"
   }
 }

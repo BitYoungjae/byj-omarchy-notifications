@@ -12,6 +12,28 @@ function entryKey(timestamp, id) {
   return String(Number(timestamp) || 0) + "-" + String(Number(id) || 0)
 }
 
+// The daemon id back out of a key, for stores written before it was kept
+// as a field of its own (those keys still end in ".json").
+function idFromKey(key) {
+  var match = /^\d+-(\d+)/.exec(String(key || ""))
+  return match ? Number(match[1]) : 0
+}
+
+// Whether an on-screen popup row is this entry's toast: the same daemon id
+// from the same moment. The first-party stamps its own time on the row, a
+// few milliseconds after this store stamped the entry, and a restored row
+// after a shell restart carries that same stamp back. Ids restart with every
+// shell process, so the time is what tells two generations apart.
+var TOAST_MATCH_MS = 2000
+
+function toastRowMatches(row, entry) {
+  var r = row || {}
+  var e = entry || {}
+  var id = Number(e.id) || 0
+  if (id <= 0 || Number(r.originalId) !== id) return false
+  return Math.abs((Number(r.timestamp) || 0) - (Number(e.timestamp) || 0)) <= TOAST_MATCH_MS
+}
+
 function stringHint(hints, name) {
   try {
     if (hints) {
@@ -37,6 +59,7 @@ function entryFromNotification(n, now) {
   if (!isFinite(expire) || expire < 0) expire = 0
   return {
     key: entryKey(now, r.id),
+    id: Number(r.id) || 0,
     app: app,
     appIcon: String(r.appIcon || ""),
     desktopEntry: String(r.desktopEntry || ""),
@@ -62,6 +85,7 @@ function entryFromStored(value) {
   if (!isFinite(expire) || expire < 0) expire = 0
   return {
     key: String(v.key),
+    id: Number(v.id) || idFromKey(v.key),
     app: String(v.app || ""),
     appIcon: String(v.appIcon || ""),
     desktopEntry: String(v.desktopEntry || ""),
@@ -485,6 +509,8 @@ function relativeTime(timestamp, now) {
 if (typeof module !== "undefined") {
   module.exports = {
     entryKey: entryKey,
+    idFromKey: idFromKey,
+    toastRowMatches: toastRowMatches,
     stringHint: stringHint,
     entryFromNotification: entryFromNotification,
     entryFromStored: entryFromStored,

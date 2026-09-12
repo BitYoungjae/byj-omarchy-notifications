@@ -3,7 +3,8 @@
 An [Omarchy 4](https://omarchy.org) shell plugin: a bell in the bar carrying an
 unread badge, opening a flyout that lists your notifications under two tabs —
 **Unread** and **All**. Clicking a row does what clicking the toast would have
-done, and the badge only ever counts what still deserves your attention.
+done, even long after the toast is gone, and the badge only ever counts what
+still deserves your attention.
 
 ![Notification Center](preview.png)
 
@@ -16,14 +17,18 @@ adds what a notification centre needs on top of it:
 - **a read flag per notification**, so the bell can carry a count of what you
   have not looked at yet
 - **a deeper backlog** — 500 notifications instead of ten
+- **click-through that outlives the toast** — a Slack notification still opens
+  its channel, a Claude Code notification still raises its Ghostty tab, from
+  the list, minutes later
 - **a badge that empties itself** when a notification stops mattering: after
   a reboot, when its sender withdraws it, when it was only ever a status
   flash, when it is the fifth copy of the same ping
 
-It does **not** replace the notification daemon. `omarchy.notifications` keeps
-the D-Bus name, the toasts and do-not-disturb; this plugin listens beside it,
-in the same process, and keeps its own store. So it installs with one command,
-coexists with everything, and does not need re-syncing every Omarchy release.
+It does **not** fork the notification daemon. `omarchy.notifications` keeps
+drawing the toasts and owning do-not-disturb; this plugin runs the installed
+first-party service unmodified, inside itself, and keeps its own store next to
+it. So it installs with one command, follows every Omarchy update to that
+service as it lands, and does not need re-syncing.
 
 ## Install
 
@@ -35,6 +40,23 @@ Pick a bar section when prompted, or place it afterwards:
 
 ```bash
 omarchy bar move byj.notification-center --section right
+```
+
+Enabling it makes it the active implementation of `omarchy.notifications`:
+the built-in entry is switched off (it lands in `disabledPlugins` in
+`~/.config/omarchy/shell.json`) and switched back on when the plugin is
+disabled or removed. This is the same mechanism `omarchy plugin clone` uses,
+declared in the manifest as `omarchy.clonedFrom`. Toasts, do-not-disturb and
+`omarchy-shell notifications …` keep working exactly as before; the code
+behind them is still Omarchy's own.
+
+Upgrading from a version before 0.4 — one that was enabled before it declared
+itself a clone — needs the switch made once:
+
+```bash
+omarchy plugin disable byj.notification-center
+omarchy plugin enable byj.notification-center right --before byj.spotify   # your own placement
+omarchy-restart-shell
 ```
 
 To update or remove:
@@ -50,7 +72,7 @@ omarchy plugin remove byj.notification-center
 |---|---|
 | Left click the bell | Open / close the flyout |
 | Right click the bell | Toggle do-not-disturb |
-| Left click a row | Run the notification's click, as clicking its toast would, or bring the sender's window forward; marks it read and closes |
+| Left click a row | Run the notification's click, exactly as clicking its toast would, or bring the sender's window forward; marks it read and closes |
 | Right click a row | Mark read without leaving the list |
 | `Mark all read` | Clear the badge, keep the list |
 | `Clear` | Empty the centre (Omarchy's own history is left alone) |
@@ -86,21 +108,24 @@ o.bind("SUPER SHIFT, N", "exec", "omarchy-shell notification-center activateLate
 
 ## How it works
 
-Quickshell keeps one notification server per process, and every
-`NotificationServer` declared in that process hears every notification it
-receives. This plugin declares one of its own, next to the first-party's, and
-snapshots each notification as it arrives — the same live object the toast is
-drawn from, with everything it carries: the sender's desktop entry, the
-`transient` hint, the timeout it asked for, its actions, and later the reason
-it closed. Each snapshot goes into
-`~/.local/state/byj-notification-center/store.json` with a read flag, newest
-500 kept. Nothing is polled and nothing is read back out of Omarchy's history;
-a notification silenced by do-not-disturb reaches the store the same way a
-shown one does.
+Since Omarchy 4.0.3 a plugin's `shell.serviceFor` resolves only the plugin's
+own service, so the first-party notification service cannot be attached to
+from the outside any more. It is attached to from the inside instead: the
+manifest declares this plugin the clone of `omarchy.notifications`, which
+makes it the enabled implementation of that target, and its service loads
+`/usr/share/omarchy/shell/plugins/notifications/Service.qml` — the installed
+first-party, unmodified — and runs it as a child. The bar's do-not-disturb
+indicator and the `notifications` IPC target reach that instance through this
+plugin exactly as they reached the original.
 
-Do-not-disturb itself stays the first-party's: the bell mirrors the preference
-file it writes (`~/.local/state/omarchy/notifications.json`) and toggles it
-through `omarchy-shell notifications setDnd`.
+The centre's own record of each notification comes from a second
+`NotificationServer`: Quickshell keeps one server per process and hands every
+wrapper declared in it the same live objects, with everything they carry —
+the sender's desktop entry, the `transient` hint, the timeout it asked for,
+its actions, and later the reason it closed. Each one is snapshotted into
+`~/.local/state/byj-notification-center/store.json` with a read flag, newest
+500 kept. A notification silenced by do-not-disturb reaches the store the
+same way a shown one does.
 
 ### What counts as unread
 
@@ -123,8 +148,8 @@ with four exceptions, each one a case where nothing is left to act on:
   a chat app that saw you read the message there, a browser tab that closed —
   the row is marked read.
 - **Dismissed on screen.** Closing or clicking the toast marks the row read
-  too, except under do-not-disturb, where it is the shell dismissing a
-  notification nobody has seen.
+  too. A notification the shell silenced under do-not-disturb is not counted
+  as dismissed: nobody saw it.
 
 Expiry — the toast simply timing out — changes nothing: that is the case the
 centre exists for.
@@ -140,16 +165,22 @@ runs:
    channel and a Ghostty toast raise the tab Claude Code is waiting in. A
    libnotify action only works while the sender still considers the
    notification open, and the first-party service closes it the moment the
-   toast leaves the screen. So this step is there while the toast is, and
-   gone afterwards.
+   toast leaves the screen. So this plugin keeps the notification open at the
+   sender past its toast (the way GNOME's notification list does), until you
+   act on it, clear the centre, or it ages out of the store. Marking a row read
+   does not close it, so rows in the All tab stay as clickable as their toasts
+   were. See `LiveNotifications.qml` for the mechanism and for exactly which
+   parts of the first-party service it relies on; if a future Omarchy changes
+   them, the plugin notices at runtime and simply falls back to step 3.
 3. **Focus the sender's window.** All that is left once the notification is
-   closed at the sender. Browser notifications are matched by the origin they
-   came from (a Chrome web app's window is `chrome-app.slack.com…`, not
+   closed at the sender: after a shell restart, for one that arrived silenced,
+   or with the fallback above. Browser notifications are matched by the origin
+   they came from (a Chrome web app's window is `chrome-app.slack.com…`, not
    "Google Chrome"), GLib applications that send no app name by their desktop
    entry or icon name (`com.mitchellh.ghostty`), everything else by name.
 
 `status` tells you how far a click can reach: `live` is how many notifications
-are currently still open at the daemon, which is the number step 2 applies to.
+are currently held open at their sender, which is the number step 2 applies to.
 
 ## Development
 
@@ -166,10 +197,10 @@ shell's hot reload watches that directory without following symlinks, and
 
 ## Requirements
 
-Omarchy 4.0.3 or later. Earlier 4.0.x handed plugins a wider shell API; since
-4.0.3 a plugin's `shell.serviceFor` resolves only its own service, which is
-why this plugin listens to the daemon directly instead of attaching to the
-first-party service. No other dependencies.
+Omarchy 4.0.3 or later (tested on 4.0.3). The first-party service is loaded
+from `$OMARCHY_PATH/shell/plugins/notifications/Service.qml`; if a future
+Omarchy moves it, the plugin says so in the journal and toasts are not drawn
+until it is updated. No other dependencies.
 
 ## Licence
 
@@ -177,5 +208,6 @@ MIT — see [LICENSE](LICENSE).
 
 Omarchy itself is MIT-licensed by Basecamp. This plugin ships no Omarchy code;
 it calls the shell's public plugin API (`qs.Ui`, `qs.Commons`,
-`shell.serviceFor`), Quickshell's notification server API, and reads the one
-preference file the first-party notification service writes.
+`shell.serviceFor`), Quickshell's notification server API, runs the installed
+first-party notification service as described above and — for click-through
+only — attaches to that service's live notification objects.

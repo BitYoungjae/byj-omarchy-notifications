@@ -120,13 +120,13 @@ Panel {
 
     // What the center is holding, for a quick look when a click did not do
     // what was expected. `unread` and `total` count rows; `live` is how many
-    // notifications are still open at the daemon, which is what a row click
-    // needs to run the sender's own action.
+    // notifications are being held open at their sender past their toast,
+    // which is what a row click needs to run the sender's own action.
     function status(): string {
       return JSON.stringify({
         unread: root.unreadCount,
         total: root.allRows.length,
-        live: root.service ? root.service.heldCount : 0,
+        live: root.service ? root.service.liveCount : 0,
         doNotDisturb: root.dnd
       })
     }
