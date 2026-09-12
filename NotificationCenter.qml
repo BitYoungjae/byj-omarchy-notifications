@@ -8,7 +8,8 @@ import "Center.js" as Center
 
 // Notification center: a bell in the bar carrying the unread count, and a
 // flyout listing what came in. The list has two tabs — the notifications not
-// read yet, and everything still inside the store's retention window.
+// read yet, and everything still inside the store's retention window. A run
+// of identical notifications is one row with a count.
 //
 // Presentation only. Read state and the row list live on this plugin's
 // service half (Service.qml), so the badge stays correct whether or not a bar
@@ -31,8 +32,9 @@ Panel {
   readonly property int unreadCount: service ? service.unreadCount : 0
   readonly property bool dnd: service ? service.doNotDisturb : false
 
-  readonly property var allRows: service ? service.entries : []
-  readonly property var unreadRows: allRows.filter(function(row) { return row.unread === true })
+  // Groups, newest first: each stands for one or more entries.
+  readonly property var allRows: service ? service.allGroups : []
+  readonly property var unreadRows: service ? service.unreadGroups : []
 
   property string tab: "unread"
   readonly property var rows: tab === "unread" ? unreadRows : allRows
@@ -97,8 +99,8 @@ Panel {
       return "ok"
     }
 
-    // Click-through, exactly what left-clicking the row does. The key is the
-    // store's: the first-party's file name, <timestamp>-<id>.json.
+    // Click-through for one entry, exactly what left-clicking its row does.
+    // The key is the store's: <arrival timestamp>-<daemon id>.
     function activate(key: string): string {
       if (!root.service || !root.service.entryFor(key)) return "unknown"
       root.service.activate(key)
@@ -106,26 +108,25 @@ Panel {
       return "ok"
     }
 
-    // The newest unread notification, or the newest of all once everything
-    // has been read. Meant for a keybinding: "take me to what just came in".
+    // The newest unread row, or the newest of all once everything has been
+    // read. Meant for a keybinding: "take me to what just came in".
     function activateLatest(): string {
       var rows = root.unreadRows.length > 0 ? root.unreadRows : root.allRows
       if (!root.service || rows.length === 0) return "none"
-      root.service.activate(rows[0].key)
+      root.service.activateGroup(rows[0].keys)
       if (root.opened) root.close()
       return rows[0].key
     }
 
     // What the center is holding, for a quick look when a click did not do
-    // what was expected. `live` is how many notifications are still open at
-    // their sender; `liveActions` false means the first-party service no
-    // longer has the shape this plugin attaches to and rows only focus.
+    // what was expected. `unread` and `total` count rows; `live` is how many
+    // notifications are still open at the daemon, which is what a row click
+    // needs to run the sender's own action.
     function status(): string {
       return JSON.stringify({
         unread: root.unreadCount,
         total: root.allRows.length,
-        live: root.service ? root.service.liveCount : 0,
-        liveActions: root.service ? root.service.liveActionsSupported : false,
+        live: root.service ? root.service.heldCount : 0,
         doNotDisturb: root.dnd
       })
     }
@@ -297,6 +298,8 @@ Panel {
               required property string body
               required property double timestamp
               required property bool unread
+              required property int count
+              required property string members
 
               width: ListView.view.width
               implicitHeight: entryBody.implicitHeight + Style.space(14)
@@ -340,7 +343,7 @@ Panel {
                   Text {
                     id: appLabel
                     anchors.left: parent.left
-                    anchors.right: timeLabel.left
+                    anchors.right: countLabel.visible ? countLabel.left : timeLabel.left
                     anchors.rightMargin: Style.space(8)
                     text: Center.appLabel(entry)
                     color: root.dimmed
@@ -349,6 +352,19 @@ Panel {
                     font.bold: true
                     font.letterSpacing: 0.8
                     elide: Text.ElideRight
+                  }
+
+                  // How many identical notifications this row stands for.
+                  Text {
+                    id: countLabel
+                    anchors.right: timeLabel.left
+                    anchors.rightMargin: Style.space(8)
+                    visible: text !== ""
+                    text: Center.countLabel(entry.count)
+                    color: Color.accent
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                    font.bold: true
                   }
 
                   Text {
@@ -394,14 +410,16 @@ Panel {
                 // Left mirrors clicking the toast: run the notification's own
                 // action, or focus the app that sent it, and get out of the
                 // way. Right only clears the unread mark, for working down a
-                // backlog without leaving the list.
+                // backlog without leaving the list. Both act on every entry
+                // the row stands for.
                 onClicked: function(mouse) {
                   if (!root.service) return
+                  var keys = Center.memberKeys(entry.members)
                   if (mouse.button === Qt.RightButton) {
-                    root.service.markRead(entry.key)
+                    root.service.markGroupRead(keys)
                     return
                   }
-                  root.service.activate(entry.key)
+                  root.service.activateGroup(keys)
                   root.close()
                 }
               }

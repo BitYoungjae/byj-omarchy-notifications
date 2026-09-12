@@ -1,87 +1,67 @@
 import QtQuick
 import Quickshell
 import Quickshell.Io
+import Quickshell.Services.Notifications
 import qs.Commons
 import "Center.js" as Center
 
 // Notification center store.
 //
-// This plugin does NOT own a notification daemon. Omarchy's first-party
-// `omarchy.notifications` keeps that role — it holds the
-// org.freedesktop.Notifications bus name, draws the toasts, and owns
-// do-not-disturb. Replacing it would mean forking the daemon and asking every
-// user to disable the built-in; attaching to it instead means this plugin
-// installs with one command and survives Omarchy upgrades.
+// This plugin does NOT own the notification daemon. Omarchy's first-party
+// `omarchy.notifications` keeps that role — it draws the toasts, owns
+// do-not-disturb and decides what leaves the screen when. What this plugin
+// owns is a second view of the same stream: Quickshell keeps one
+// notification server per process, and every `NotificationServer` declared
+// in that process hears every notification it receives. So this service
+// declares one of its own and records what comes through it — the same live
+// objects the first-party is handed, with everything they carry: the
+// transient hint, the requested timeout, the sender's desktop entry, its
+// actions, and the reason each one eventually closed.
 //
-// What it adds is the two things the first-party service has no reason to
-// keep: a read flag per notification, and a backlog deeper than the ten
-// entries its own history directory retains. And one thing it cannot do on
-// its own terms: keep a notification clickable after its toast has gone
-// (see LiveNotifications.qml).
+// Nothing here reaches into the first-party. Since Omarchy 4.0.3 a plugin's
+// `shell.serviceFor` resolves only the plugin's own service, so the earlier
+// design of attaching to the first-party's popup model is closed off; what
+// remains of do-not-disturb is read from the file the first-party writes it
+// to and toggled through its IPC.
 Item {
   id: service
 
-  // Injected by omarchy-shell's service loader.
+  // Injected by omarchy-shell's service loader. Unused: everything this
+  // service needs comes through the daemon and the file system.
   property var shell: null
-
-  // The first-party notification service, reached through the host rather
-  // than by path so that an enabled clone of it answers just as well.
-  readonly property var source: shell && typeof shell.serviceFor === "function"
-    ? shell.serviceFor("omarchy.notifications") : null
-
-  readonly property bool sourceReady: source !== null && source !== undefined
-
-  // Do-not-disturb stays the first-party service's state; the bell only
-  // mirrors and toggles it, so the two never disagree.
-  readonly property bool doNotDisturb: sourceReady && source.doNotDisturb === true
-
-  function setDoNotDisturb(value) {
-    if (sourceReady && typeof source.setDoNotDisturb === "function")
-      source.setDoNotDisturb(value === true)
-  }
 
   readonly property string home: Quickshell.env("HOME")
   readonly property string stateDir: home + "/.local/state/byj-notification-center/"
   readonly property string storePath: stateDir + "store.json"
 
-  // Where the first-party service parks notifications that have left the
-  // screen. Read only as the do-not-disturb backstop below — everything that
-  // actually gets shown is picked up from popupModel, in process.
-  readonly property string sourceHistoryDir: home + "/.local/state/omarchy/notifications/history/"
+  // Where the first-party keeps its do-not-disturb preference.
+  readonly property string sourceSettingsPath: home + "/.local/state/omarchy/notifications.json"
 
   // How many notifications the center keeps. The first-party history is
   // capped at ten; this store is the reason the "All" tab can go deeper.
   readonly property int retention: 500
+
+  // When this graphical session started, from Hyprland's instance signature.
+  // Everything from before it is from a session whose windows are gone.
+  readonly property double sessionStart: Center.sessionStartFromSignature(Quickshell.env("HYPRLAND_INSTANCE_SIGNATURE"))
 
   // Newest-first plain snapshots. Deliberately not the live Notification
   // objects: those die with their sender, and reading a role off a destroyed
   // one is a crash rather than an error.
   property var entries: []
 
-  readonly property int unreadCount: {
-    var n = 0
-    for (var i = 0; i < entries.length; i++) if (entries[i].unread) n++
-    return n
-  }
+  // What the panel lists: consecutive repeats folded into one row each.
+  readonly property var allGroups: Center.groupRuns(entries)
+  readonly property var unreadGroups: Center.groupRuns(entries.filter(function(entry) { return entry.unread === true }))
 
-  // Notifications cleared out of the center. The first-party history is left
-  // alone — it is not this plugin's state to wipe — so the sweep needs a
-  // watermark to tell "already cleared" from "not seen yet", or a clear would
-  // undo itself on the next do-not-disturb tick.
+  // The badge counts rows, not repeats: five identical pings are one thing
+  // to look at.
+  readonly property int unreadCount: unreadGroups.length
+
+  // Notifications cleared out of the center. Anything at or before this
+  // watermark is refused on the way in, so an in-place edit of a cleared
+  // notification cannot bring it back.
   property double clearedBefore: 0
-
-  // The live objects behind the entries that arrived this session, kept open
-  // at the sender past their toast so a row click can still run the same
-  // action the toast would have. Everything else about a notification is a
-  // snapshot; this is the one live thing, and it degrades to nothing.
-  LiveNotifications {
-    id: live
-    source: service.source
-    onSuperseded: function(key) { service.forget(key) }
-  }
-
-  readonly property bool liveActionsSupported: live.supported
-  readonly property int liveCount: live.count
 
   function entryFor(key) {
     var k = String(key || "")
@@ -94,11 +74,131 @@ Item {
     return entry ? entry.unread === true : false
   }
 
+  // ------------------------------------------------------------- daemon
+
+  // Same advertised capabilities as the first-party, so whichever of the two
+  // wrappers goes live last leaves GetCapabilities unchanged.
+  NotificationServer {
+    id: server
+    keepOnReload: false
+    imageSupported: true
+    actionsSupported: true
+    bodyMarkupSupported: true
+    bodyHyperlinksSupported: true
+    persistenceSupported: true
+
+    onNotification: function(notification) { service.receive(notification) }
+  }
+
+  // The live objects behind entries still open at the daemon, by key. The
+  // first-party tracks them and closes them as their toasts leave; until
+  // then a row click can still run the action the toast would have. This is
+  // the one live thing in the store, and it degrades to nothing.
+  property var held: ({})
+  property int heldCount: 0
+
+  readonly property var updateSignals: [
+    "summaryChanged", "bodyChanged", "appNameChanged", "appIconChanged",
+    "urgencyChanged", "expireTimeoutChanged", "hintsChanged"
+  ]
+
+  // A plain copy of what the entry needs, taken in one go: the object can be
+  // torn down by the server at any later point.
+  function snapshot(notification, timestamp) {
+    var props = null
+    try {
+      props = {
+        id: notification.id,
+        appName: notification.appName,
+        appIcon: notification.appIcon,
+        desktopEntry: notification.desktopEntry,
+        summary: notification.summary,
+        body: notification.body,
+        urgency: notification.urgency,
+        expireTimeout: notification.expireTimeout,
+        transient: notification.transient,
+        hints: notification.hints
+      }
+    } catch (e) {
+      return null
+    }
+    return Center.entryFromNotification(props, timestamp)
+  }
+
+  function receive(notification) {
+    var now = Date.now()
+    var entry = snapshot(notification, now)
+    if (!entry) return
+    // "Skip any kind of persistence" is what the hint asks for.
+    if (entry.transient) return
+    if (entry.timestamp <= service.clearedBefore) return
+
+    // Noise is kept — it is still findable under All — but arrives read.
+    if (Center.noiseReason(entry)) entry.unread = false
+
+    var record = {
+      key: entry.key,
+      timestamp: now,
+      notification: notification,
+      handlers: []
+    }
+    held[entry.key] = record
+    heldCount++
+    connectSignals(record)
+    absorb([entry])
+  }
+
+  function connectSignals(record) {
+    var n = record.notification
+    var onUpdate = function() { service.refresh(record) }
+    var onClosed = function(reason) { service.closedAt(record, reason) }
+    var onGone = function() { service.drop(record) }
+
+    function hook(signal, fn) {
+      if (!signal || typeof signal.connect !== "function") return
+      signal.connect(fn)
+      record.handlers.push({ signal: signal, fn: fn })
+    }
+    for (var i = 0; i < updateSignals.length; i++) hook(n[updateSignals[i]], onUpdate)
+    hook(n.closed, onClosed)
+    // A server torn down under us destroys without closing.
+    try { hook(n.destroyed, onGone) } catch (e) {}
+  }
+
+  // A client updating a notification through replaces_id writes the new
+  // content onto the object already held. Same key, same read flag; only
+  // what the row paints changes.
+  function refresh(record) {
+    if (held[record.key] !== record) return
+    var entry = snapshot(record.notification, record.timestamp)
+    if (!entry || entry.transient) return
+    absorb([entry])
+  }
+
+  function closedAt(record, reason) {
+    if (held[record.key] !== record) return
+    drop(record)
+    if (Center.readOnClose(reason, service.doNotDisturb)) markRead(record.key)
+  }
+
+  // Forget a record without touching the notification itself.
+  function drop(record) {
+    if (held[record.key] !== record) return
+    delete held[record.key]
+    heldCount--
+    for (var i = 0; i < record.handlers.length; i++) {
+      try {
+        record.handlers[i].signal.disconnect(record.handlers[i].fn)
+      } catch (e) {}
+    }
+    record.handlers = []
+  }
+
   // ------------------------------------------------------------- ingest
 
-  // Fold a batch of freshly-read entries into the store. Entries already
-  // known keep their read flag — a sweep must never resurrect something the
-  // user has read — but pick up edits the sender made in place.
+  // Fold entries into the store. Entries already known keep their read flag
+  // — an edit must never resurrect something the user has read — but pick
+  // up the changes the sender made in place.
   function absorb(incoming) {
     if (!incoming || incoming.length === 0) return
 
@@ -127,103 +227,33 @@ Item {
 
   function commit(list) {
     entries = Center.normalize(list, retention)
-    // An entry that just aged out of the store can no longer be clicked, so
-    // its sender may as well hear that it is done with.
-    live.prune(keyIndex(entries))
     scheduleSave()
   }
 
-  function keyIndex(list) {
-    var index = ({})
-    for (var i = 0; i < list.length; i++) index[list[i].key] = true
-    return index
+  // ------------------------------------------------------------- do not disturb
+
+  // Do-not-disturb stays the first-party's state; the bell only mirrors and
+  // toggles it, so the two never disagree. The mirror is the file it
+  // persists the preference to, rewritten on every change.
+  property bool doNotDisturb: false
+
+  FileView {
+    id: sourceSettings
+    path: service.sourceSettingsPath
+    watchChanges: true
+    printErrors: false
+    onLoaded: service.doNotDisturb = Center.parseDnd(text()) === true
+    onLoadFailed: service.doNotDisturb = false
+    onFileChanged: reload()
   }
 
-  // Every notification that reaches the screen passes through the
-  // first-party popup model, in this process. Insertions, removals and
-  // reorders all land here; the scan only adds what it has not seen, so
-  // running it more often than strictly necessary costs nothing.
-  Connections {
-    target: service.sourceReady ? service.source.popupModel : null
-    ignoreUnknownSignals: true
-    function onCountChanged() { service.ingestPopups() }
-    function onDataChanged() { service.ingestPopups() }
+  function setDoNotDisturb(value) {
+    if (dndProc.running) return
+    dndProc.command = ["omarchy-shell", "notifications", "setDnd", value === true ? "on" : "off"]
+    dndProc.running = true
   }
 
-  function ingestPopups() {
-    if (!sourceReady) return
-    var model = source.popupModel
-    if (!model) return
-
-    var batch = []
-    for (var i = 0; i < model.count; i++) {
-      var row = null
-      try {
-        row = model.get(i)
-      } catch (e) {
-        continue
-      }
-      // The first-party "No recent notifications" placeholder carries
-      // originalId -1 and is not a notification.
-      if (!row || row.originalId < 0) continue
-      var entry = Center.entryFromRow(row)
-      if (!entry) continue
-      // Same watermark as absorb: what a clear left on screen is not the
-      // center's to keep hold of either.
-      if (entry.timestamp > service.clearedBefore) live.retain(row)
-      batch.push(entry)
-    }
-    absorb(batch)
-  }
-
-  // Do-not-disturb is the one path that never reaches popupModel: a silenced
-  // notification is written straight into the first-party history and never
-  // shown. That directory is the only place to read it back from.
-  // True once the first sweep has been folded in. That first batch is
-  // whatever was already on the machine before this plugin existed; counting
-  // it as unread would hand a new user a badge they never earned, so it is
-  // absorbed as already-read and the list simply starts populated.
-  property bool primed: false
-
-  Process {
-    id: historyProc
-    running: false
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: {
-        var batch = Center.parseHistory(text)
-        if (!service.primed) {
-          for (var i = 0; i < batch.length; i++) batch[i].unread = false
-          service.primed = true
-        }
-        service.absorb(batch)
-      }
-    }
-  }
-
-  function sweepHistory() {
-    if (historyProc.running) return
-    // awk 1 rather than cat: a torn file missing its trailing newline must
-    // not glue itself onto the next one and take a valid entry down with it.
-    historyProc.command = ["bash", "-c",
-      "awk 1 \"$1\"/*.json 2>/dev/null || true", "--", service.sourceHistoryDir]
-    historyProc.running = true
-  }
-
-  // The history keeps ten entries, so a five-second beat cannot miss one
-  // unless more than ten arrive between ticks — and it only runs while
-  // do-not-disturb is actually on.
-  Timer {
-    running: service.doNotDisturb && service.storeLoaded
-    interval: 5000
-    repeat: true
-    triggeredOnStart: true
-    onTriggered: service.sweepHistory()
-  }
-
-  // Catch the tail of a do-not-disturb window the moment it ends, and
-  // anything that arrived while the shell was not running.
-  onDoNotDisturbChanged: if (storeLoaded) sweepHistory()
+  Process { id: dndProc; running: false }
 
   // ------------------------------------------------------------- read state
 
@@ -265,31 +295,16 @@ Item {
     scheduleSave()
   }
 
-  // Drop one entry without moving the cleared watermark: the sender replaced
-  // it in place, and the replacement is on its way in as an entry of its own.
-  function forget(key) {
-    var k = String(key || "")
-    var next = entries.filter(function(entry) { return entry.key !== k })
-    if (next.length === entries.length) return
-    entries = next
-    scheduleSave()
-  }
-
-  // Empties the center. The first-party history is left as it is — its own
-  // `showHistory` replay is not this plugin's to erase — so the watermark
-  // below is what keeps the sweep from reading it all straight back in.
+  // Empties the center. Toasts still on screen are the first-party's and
+  // stay put; the watermark keeps their later edits and closes from
+  // reinstating them here.
   function clearAll() {
     var newest = 0
     for (var i = 0; i < entries.length; i++)
       if (entries[i].timestamp > newest) newest = entries[i].timestamp
-    // Anything still on screen outlives the clear: it has not been dealt
-    // with yet, and it would reappear on the next ingest anyway.
     clearedBefore = Math.max(clearedBefore, newest)
-    // Cleared is dealt with, as far as the senders are concerned.
-    live.releaseAll()
     entries = []
     scheduleSave()
-    ingestPopups()
   }
 
   // ------------------------------------------------------------- activation
@@ -300,50 +315,72 @@ Item {
   //   1. Omarchy's own action toasts carry their click as data (execArgv),
   //      which the store keeps, so they work from a row indefinitely.
   //   2. The sender's own default action — Slack's "open this channel",
-  //      Ghostty's "raise this tab" — kept alive past the toast by
-  //      LiveNotifications. The only step that can reach the exact target.
-  //   3. Bring the sender's window forward. All that is left once the
-  //      notification is closed at the sender: after a shell restart, for one
-  //      silenced under do-not-disturb, or when the first-party's shape has
-  //      changed under us and nothing is being retained.
+  //      Ghostty's "raise this tab". Only while the notification is still
+  //      open at the daemon, which the first-party ends when the toast
+  //      leaves the screen.
+  //   3. Bring the sender's window forward. All that is left afterwards.
   //
   // A toast still on screen comes down with the click, as it would have had
-  // the toast itself been clicked.
+  // the toast itself been clicked. The first-party takes toasts down by
+  // summary, so an identical toast beside it comes down too.
   function activate(key) {
     var k = String(key || "")
     var entry = entryFor(k)
     markRead(k)
     if (!entry) return
 
+    var record = held[k]
     var argv = Center.parseExecArgv(entry.execArgv)
     if (argv) {
       // Detached so it outlives the shell, which installer toasts depend on:
       // they restart it.
       Util.execArgv(argv)
-      live.release(k)
-    } else if (!live.invoke(k)) {
-      live.release(k)
+    } else if (!invokeDefault(record)) {
       focusWindow(Center.focusPatterns(entry))
     }
-    dismissToast(k)
+    // Held means its toast is most likely still up; critical never expires.
+    if (record || entry.urgency === 2) dismissToast(entry)
   }
 
-  function dismissToast(key) {
-    if (!sourceReady || !source.popupModel || typeof source.dismissPopup !== "function") return
-    var model = source.popupModel
-    for (var i = 0; i < model.count; i++) {
-      var row = null
-      try {
-        row = model.get(i)
-      } catch (e) {
-        continue
-      }
-      if (row && row.originalId >= 0 && Center.rowKey(row) === key) {
-        source.dismissPopup(i)
-        return
-      }
-    }
+  // Run a row's members as one: the newest gets the click, the rest are
+  // simply done with.
+  function activateGroup(keys) {
+    var list = Array.isArray(keys) ? keys : []
+    if (list.length === 0) return
+    activate(list[0])
+    for (var i = 1; i < list.length; i++) markRead(list[i])
   }
+
+  function markGroupRead(keys) {
+    var list = Array.isArray(keys) ? keys : []
+    for (var i = 0; i < list.length; i++) markRead(list[i])
+  }
+
+  function invokeDefault(record) {
+    if (!record) return false
+    try {
+      var actions = record.notification.actions
+      for (var i = 0; i < actions.length; i++) {
+        if (actions[i] && actions[i].identifier === "default") {
+          actions[i].invoke()
+          return true
+        }
+      }
+    } catch (e) {
+      // Torn down by the server — nothing to invoke.
+      drop(record)
+    }
+    return false
+  }
+
+  function dismissToast(entry) {
+    var summary = String(entry && entry.summary || "")
+    if (!summary || dismissProc.running) return
+    dismissProc.command = ["omarchy-shell", "notifications", "dismiss", summary]
+    dismissProc.running = true
+  }
+
+  Process { id: dismissProc; running: false }
 
   // Focus an existing Hyprland window belonging to the sender, trying each
   // pattern in turn. The Omarchy helper does the case-insensitive matching.
@@ -367,11 +404,11 @@ Item {
     watchChanges: false
     atomicWrites: true
     printErrors: false
-    onLoaded: service.loadStore(text(), true)
+    onLoaded: service.loadStore(text())
     // First run: the file does not exist yet. Without this branch the store
     // never counts as loaded, every save stays a no-op, and nothing is ever
     // written.
-    onLoadFailed: service.loadStore("", false)
+    onLoadFailed: service.loadStore("")
   }
 
   Timer {
@@ -386,12 +423,8 @@ Item {
     saveTimer.restart()
   }
 
-  function loadStore(raw, existed) {
+  function loadStore(raw) {
     if (service.storeLoaded) return
-
-    // Only a genuine first run gets the read-everything grace above; a store
-    // that already exists has been tracking read state all along.
-    service.primed = existed === true
 
     var loaded = []
     var watermark = 0
@@ -399,12 +432,10 @@ Item {
       var parsed = JSON.parse(String(raw || "").trim() || "{}")
       if (parsed && Array.isArray(parsed.entries)) {
         for (var i = 0; i < parsed.entries.length; i++) {
-          var value = parsed.entries[i]
-          if (!value || !value.key) continue
-          var entry = Center.entryFromRow(value)
+          var entry = Center.entryFromStored(parsed.entries[i])
           if (!entry) continue
-          entry.key = String(value.key)
-          entry.unread = value.unread === true
+          // Unread from a previous session has nothing left to point at.
+          if (entry.unread && Center.isFromPastSession(entry, service.sessionStart)) entry.unread = false
           loaded.push(entry)
         }
       }
@@ -418,16 +449,14 @@ Item {
     // finishing; folding what is already in memory in keeps them.
     service.entries = Center.normalize(loaded.concat(service.entries), service.retention)
     service.storeLoaded = true
-
-    // Pick up whatever arrived while the shell was not running, then take
-    // over from the live model.
-    service.sweepHistory()
-    service.ingestPopups()
+    // The past-session pass above only touched what was on disk; write it
+    // back so the next load does not redo it.
+    scheduleSave()
   }
 
   function flushStore() {
     storeFile.setText(JSON.stringify({
-      version: 1,
+      version: 2,
       clearedBefore: service.clearedBefore,
       entries: service.entries
     }) + "\n")
@@ -443,6 +472,9 @@ Item {
     ensureDirProc.running = true
     // Give mkdir a tick before the read; FileView reports a missing file
     // through onLoadFailed, which loadStore handles.
-    Qt.callLater(function() { storeFile.reload() })
+    Qt.callLater(function() {
+      storeFile.reload()
+      sourceSettings.reload()
+    })
   }
 }
